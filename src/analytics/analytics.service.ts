@@ -52,7 +52,7 @@ export function formatAmount(raw: string | null | undefined): string {
 }
 
 function asInt(v: unknown): number {
-  if (typeof v === 'bigint') return Number(v);
+  if (typeof v === 'bigint') return parseInt(v.toString(), 10);
   if (typeof v === 'number') return v;
   if (typeof v === 'string') return Number.parseInt(v, 10) || 0;
   return 0;
