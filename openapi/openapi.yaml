@@ -812,7 +812,21 @@ paths:
   /v1/summary:
     get:
       operationId: AnalyticsController_summary_v1
-      parameters: []
+      parameters:
+        - name: from
+          required: false
+          in: query
+          description: Inclusive start of the window (ISO 8601 date or datetime)
+          schema:
+            example: 2026-01-01
+            type: string
+        - name: to
+          required: false
+          in: query
+          description: Exclusive end of the window (ISO 8601 date or datetime)
+          schema:
+            example: 2026-02-01
+            type: string
       responses:
         "200":
           description: Aggregated overview for the consumer.
@@ -822,7 +836,21 @@ paths:
   /v1/balances:
     get:
       operationId: AnalyticsController_balances_v1
-      parameters: []
+      parameters:
+        - name: from
+          required: false
+          in: query
+          description: Inclusive start of the window (ISO 8601 date or datetime)
+          schema:
+            example: 2026-01-01
+            type: string
+        - name: to
+          required: false
+          in: query
+          description: Exclusive end of the window (ISO 8601 date or datetime)
+          schema:
+            example: 2026-02-01
+            type: string
       responses:
         "200":
           description: Balances per asset for the consumer.
@@ -831,7 +859,14 @@ paths:
   /v1/logs:
     get:
       operationId: AnalyticsController_apiLogs_v1
-      parameters: []
+      parameters:
+        - name: take
+          required: false
+          in: query
+          schema:
+            maximum: 500
+            default: 100
+            type: number
       responses:
         "200":
           description: API request log for the consumer.
@@ -840,7 +875,14 @@ paths:
   /v1/logs/webhooks:
     get:
       operationId: AnalyticsController_webhookLogs_v1
-      parameters: []
+      parameters:
+        - name: take
+          required: false
+          in: query
+          schema:
+            maximum: 500
+            default: 100
+            type: number
       responses:
         "200":
           description: Webhook delivery log for the consumer.

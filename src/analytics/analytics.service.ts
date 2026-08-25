@@ -1,33 +1,70 @@
 import { Injectable } from '@nestjs/common';
 import { GatewayConsumer } from '../common/interfaces/gateway-consumer.interface';
 import { PrismaService } from '../prisma/prisma.service';
+import { fromStroops, toStroops } from '../swaps/swap-math';
+import { Prisma } from '../../generated/prisma/client';
+import type { PaymentIntentStatus } from '../../generated/prisma/client';
 import type {
-  PaymentIntent,
-  PaymentIntentStatus,
-} from '../../generated/prisma/client';
+  QueryAnalyticsDto,
+  QueryAnalyticsLogsDto,
+} from './dto/query-analytics.dto';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
-
-/** Parse a decimal amount string to a number for aggregation (0 when absent). */
-function num(amount: string | null): number {
-  if (!amount) return 0;
-  const n = Number(amount);
-  return Number.isFinite(n) ? n : 0;
-}
-
-/** Round to 7 decimals (Stellar precision) and drop trailing zeros. */
-function money(n: number): string {
-  return Number(n.toFixed(7)).toString();
-}
 
 function assetLabel(asset: string): string {
   return !asset || asset === 'native' ? 'XLM' : asset;
 }
 
 /**
+ * Sum decimal amount strings in stroops (bigint). Invalid / empty amounts
+ * contribute 0 — same behaviour as the old Number-based helpers.
+ */
+export function sumAmounts(
+  amounts: Iterable<string | null | undefined>,
+): string {
+  let total = 0n;
+  for (const a of amounts) {
+    if (!a) continue;
+    try {
+      total += toStroops(a);
+    } catch {
+      // skip malformed amounts
+    }
+  }
+  return fromStroops(total);
+}
+
+/**
+ * Normalize a Postgres `numeric::text` amount into a Stellar decimal string
+ * (≤7 fractional digits, no scientific notation). Never touches `Number`.
+ */
+export function formatAmount(raw: string | null | undefined): string {
+  if (raw == null || raw === '') return '0';
+  const t = raw.trim();
+  if (!t || t === '0') return '0';
+  if (/^\d+(\.\d{1,7})?$/.test(t)) {
+    return fromStroops(toStroops(t));
+  }
+  const [whole, frac = ''] = t.split('.');
+  if (!whole || !/^\d+$/.test(whole)) return '0';
+  const frac7 = (frac + '0000000').slice(0, 7);
+  return fromStroops(BigInt(whole) * 10_000_000n + BigInt(frac7));
+}
+
+function asInt(v: unknown): number {
+  if (typeof v === 'bigint') return Number(v);
+  if (typeof v === 'number') return v;
+  if (typeof v === 'string') return Number.parseInt(v, 10) || 0;
+  return 0;
+}
+
+/**
  * Read-only aggregates derived from the consumer's existing payment intents and
  * webhook deliveries — no separate analytics store. Powers the dashboard's
  * Overview, Balances, Customers and Logs views.
+ *
+ * Money is aggregated in Postgres (`numeric`) or in stroops (`bigint`); no
+ * payment amount ever passes through JavaScript `Number`.
  */
 @Injectable()
 export class AnalyticsService {
@@ -55,97 +92,188 @@ export class AnalyticsService {
     return consumer.environment === 'prod' ? 'public' : 'testnet';
   }
 
+  private createdAtWhere(
+    from?: string,
+    to?: string,
+  ): { createdAt?: { gte?: Date; lt?: Date } } {
+    if (!from && !to) return {};
+    return {
+      createdAt: {
+        ...(from ? { gte: new Date(from) } : {}),
+        ...(to ? { lt: new Date(to) } : {}),
+      },
+    };
+  }
+
+  /** Parameterized SQL fragment for optional createdAt bounds. */
+  private createdAtSql(from?: string, to?: string): Prisma.Sql {
+    return Prisma.sql`
+      ${from ? Prisma.sql`AND "createdAt" >= ${new Date(from)}` : Prisma.empty}
+      ${to ? Prisma.sql`AND "createdAt" < ${new Date(to)}` : Prisma.empty}
+    `;
+  }
+
   // ── Overview summary ────────────────────────────────────────────────────────
-  async summary(consumer: GatewayConsumer) {
+  async summary(consumer: GatewayConsumer, query: QueryAnalyticsDto = {}) {
     const consumerId = await this.resolveConsumerId(consumer);
     const network = this.network(consumer);
+    const { from, to } = query;
+    const dateWhere = this.createdAtWhere(from, to);
+    const dateSql = this.createdAtSql(from, to);
 
-    const intents = await this.prisma.paymentIntent.findMany({
-      where: { consumerId, network },
-      select: {
-        id: true,
-        kind: true,
-        status: true,
-        amount: true,
-        asset: true,
-        source: true,
-        destination: true,
-        createdAt: true,
-        updatedAt: true,
-      },
-      orderBy: { createdAt: 'desc' },
-    });
+    // Series window: last 30 UTC days when no range; otherwise the requested window
+    // (capped at 366 days so a wide filter cannot explode the sparkline).
+    const seriesWindowEnd = to ? new Date(to) : new Date();
+    const seriesWindowStart = from
+      ? new Date(from)
+      : new Date(Date.now() - 29 * DAY_MS);
+    const spanDays =
+      from || to
+        ? Math.max(
+            1,
+            Math.min(
+              366,
+              Math.ceil(
+                (seriesWindowEnd.getTime() - seriesWindowStart.getTime()) /
+                  DAY_MS,
+              ),
+            ),
+          )
+        : 30;
+
+    type VolumeRow = { asset: string; amount: string; count: unknown };
+    type SeriesRow = { day: Date | string; count: unknown; volume: string };
+    type CountRow = { count: unknown };
+
+    const [
+      statusRows,
+      volumeRows,
+      seriesRows,
+      customerRows,
+      recent,
+      webhookStats,
+    ] = await Promise.all([
+      this.prisma.paymentIntent.groupBy({
+        by: ['status'],
+        where: { consumerId, network, ...dateWhere },
+        _count: { _all: true },
+      }),
+      this.prisma.$queryRaw<VolumeRow[]>`
+          SELECT
+            CASE WHEN asset IS NULL OR asset = 'native' THEN 'XLM' ELSE asset END AS asset,
+            COALESCE(SUM(amount::numeric), 0)::text AS amount,
+            COUNT(*)::int AS count
+          FROM payment_intent
+          WHERE "consumerId" = ${consumerId}
+            AND network = ${network}
+            AND status = 'SUCCEEDED'
+            ${dateSql}
+          GROUP BY 1
+          ORDER BY 1
+        `,
+      this.prisma.$queryRaw<SeriesRow[]>`
+          SELECT
+            (date_trunc('day', "createdAt" AT TIME ZONE 'UTC'))::date AS day,
+            COUNT(*)::int AS count,
+            COALESCE(
+              SUM(
+                CASE
+                  WHEN status = 'SUCCEEDED' THEN amount::numeric
+                  ELSE 0
+                END
+              ),
+              0
+            )::text AS volume
+          FROM payment_intent
+          WHERE "consumerId" = ${consumerId}
+            AND network = ${network}
+            AND "createdAt" >= ${seriesWindowStart}
+            AND "createdAt" < ${seriesWindowEnd}
+          GROUP BY 1
+          ORDER BY 1
+        `,
+      this.prisma.$queryRaw<CountRow[]>`
+          SELECT COUNT(DISTINCT source)::int AS count
+          FROM payment_intent
+          WHERE "consumerId" = ${consumerId}
+            AND network = ${network}
+            AND source IS NOT NULL
+            ${dateSql}
+        `,
+      this.prisma.paymentIntent.findMany({
+        where: {
+          consumerId,
+          network,
+          status: 'SUCCEEDED',
+          ...dateWhere,
+        },
+        select: {
+          id: true,
+          kind: true,
+          status: true,
+          amount: true,
+          asset: true,
+          destination: true,
+          createdAt: true,
+        },
+        orderBy: { createdAt: 'desc' },
+        take: 6,
+      }),
+      Promise.all([
+        this.prisma.webhookEndpoint.count({ where: { consumerId } }),
+        this.prisma.webhookDelivery.count({
+          where: { endpoint: { consumerId } },
+        }),
+        this.prisma.webhookDelivery.count({
+          where: { endpoint: { consumerId }, status: 'FAILED' },
+        }),
+      ]),
+    ]);
+    const [endpointCount, deliveries, failedDeliveries] = webhookStats;
 
     const byStatus: Record<string, number> = {};
-    for (const i of intents) byStatus[i.status] = (byStatus[i.status] ?? 0) + 1;
-
-    const succeeded = intents.filter((i) => i.status === 'SUCCEEDED');
-    const total = intents.length;
-    const successRate = total
-      ? Math.round((succeeded.length / total) * 1000) / 10
-      : 0;
-
-    // Gross settled volume per asset (succeeded intents).
-    const volumeMap = new Map<string, { amount: number; count: number }>();
-    for (const i of succeeded) {
-      const key = assetLabel(i.asset);
-      const cur = volumeMap.get(key) ?? { amount: 0, count: 0 };
-      cur.amount += num(i.amount);
-      cur.count += 1;
-      volumeMap.set(key, cur);
+    let total = 0;
+    for (const r of statusRows) {
+      byStatus[r.status] = r._count._all;
+      total += r._count._all;
     }
-    const volume = [...volumeMap.entries()].map(([asset, v]) => ({
-      asset,
-      amount: money(v.amount),
-      count: v.count,
+    const succeeded = byStatus['SUCCEEDED'] ?? 0;
+    const successRate = total ? Math.round((succeeded / total) * 1000) / 10 : 0;
+
+    const volume = volumeRows.map((v) => ({
+      asset: v.asset,
+      amount: formatAmount(v.amount),
+      count: asInt(v.count),
     }));
 
-    // 30-day daily series (count + settled volume) for the sparklines.
-    const start = Date.now() - 29 * DAY_MS;
+    // Build the daily series skeleton (legacy layout when no from/to), then overlay SQL.
     const series: { date: string; count: number; volume: string }[] = [];
-    for (let d = 0; d < 30; d++) {
-      const day = new Date(start + d * DAY_MS);
-      const key = day.toISOString().slice(0, 10);
-      series.push({ date: key, count: 0, volume: '0' });
+    const skeletonStart =
+      from || to ? seriesWindowStart.getTime() : Date.now() - 29 * DAY_MS;
+    for (let d = 0; d < spanDays; d++) {
+      const day = new Date(skeletonStart + d * DAY_MS);
+      series.push({
+        date: day.toISOString().slice(0, 10),
+        count: 0,
+        volume: '0',
+      });
     }
     const indexByDate = new Map(series.map((s, idx) => [s.date, idx]));
-    for (const i of intents) {
-      const key = i.createdAt.toISOString().slice(0, 10);
+    for (const row of seriesRows) {
+      const key =
+        row.day instanceof Date
+          ? row.day.toISOString().slice(0, 10)
+          : String(row.day).slice(0, 10);
       const idx = indexByDate.get(key);
       if (idx === undefined) continue;
-      series[idx].count += 1;
-      if (i.status === 'SUCCEEDED') {
-        series[idx].volume = money(num(series[idx].volume) + num(i.amount));
-      }
+      series[idx].count = asInt(row.count);
+      series[idx].volume = formatAmount(row.volume);
     }
-
-    // Webhook health.
-    const endpoints = await this.prisma.webhookEndpoint.findMany({
-      where: { consumerId },
-      select: { id: true },
-    });
-    const endpointIds = endpoints.map((e) => e.id);
-    const [deliveries, failedDeliveries] = await Promise.all([
-      endpointIds.length
-        ? this.prisma.webhookDelivery.count({
-            where: { endpointId: { in: endpointIds } },
-          })
-        : Promise.resolve(0),
-      endpointIds.length
-        ? this.prisma.webhookDelivery.count({
-            where: { endpointId: { in: endpointIds }, status: 'FAILED' },
-          })
-        : Promise.resolve(0),
-    ]);
-
-    const distinctPayers = new Set(
-      intents.map((i) => i.source).filter((s): s is string => !!s),
-    );
 
     return {
       totals: {
         all: total,
-        succeeded: succeeded.length,
+        succeeded,
         pending: byStatus['PENDING'] ?? 0,
         submitted: byStatus['SUBMITTED'] ?? 0,
         failed: byStatus['FAILED'] ?? 0,
@@ -155,13 +283,13 @@ export class AnalyticsService {
       },
       volume,
       webhooks: {
-        endpoints: endpoints.length,
+        endpoints: endpointCount,
         deliveries,
         failedDeliveries,
       },
-      customers: distinctPayers.size,
+      customers: asInt(customerRows[0]?.count),
       series,
-      recent: succeeded.slice(0, 6).map((i) => this.recentRow(i)),
+      recent: recent.map((i) => this.recentRow(i)),
     };
   }
 
@@ -186,44 +314,66 @@ export class AnalyticsService {
   }
 
   // ── Balances (settled per asset) ────────────────────────────────────────────
-  async balances(consumer: GatewayConsumer) {
+  async balances(consumer: GatewayConsumer, query: QueryAnalyticsDto = {}) {
     const consumerId = await this.resolveConsumerId(consumer);
     const network = this.network(consumer);
-    const intents = await this.prisma.paymentIntent.findMany({
-      where: { consumerId, network },
-      select: { amount: true, asset: true, status: true },
-    });
+    const { from, to } = query;
+    const dateSql = this.createdAtSql(from, to);
 
-    const map = new Map<
-      string,
-      { settled: number; pending: number; settledCount: number }
-    >();
-    for (const i of intents) {
-      const key = assetLabel(i.asset);
-      const cur = map.get(key) ?? { settled: 0, pending: 0, settledCount: 0 };
-      if (i.status === 'SUCCEEDED') {
-        cur.settled += num(i.amount);
-        cur.settledCount += 1;
-      } else if (i.status === 'PENDING' || i.status === 'SUBMITTED') {
-        cur.pending += num(i.amount);
-      }
-      map.set(key, cur);
-    }
+    type BalanceRow = {
+      asset: string;
+      settled: string;
+      pending: string;
+      settled_count: unknown;
+    };
 
-    const data = [...map.entries()]
-      .map(([asset, v]) => ({
-        asset,
-        amount: money(v.settled),
-        pending: money(v.pending),
-        count: v.settledCount,
+    const rows = await this.prisma.$queryRaw<BalanceRow[]>`
+      SELECT
+        CASE WHEN asset IS NULL OR asset = 'native' THEN 'XLM' ELSE asset END AS asset,
+        COALESCE(
+          SUM(
+            CASE WHEN status = 'SUCCEEDED' THEN amount::numeric ELSE 0 END
+          ),
+          0
+        )::text AS settled,
+        COALESCE(
+          SUM(
+            CASE
+              WHEN status IN ('PENDING', 'SUBMITTED') THEN amount::numeric
+              ELSE 0
+            END
+          ),
+          0
+        )::text AS pending,
+        COUNT(*) FILTER (WHERE status = 'SUCCEEDED')::int AS settled_count
+      FROM payment_intent
+      WHERE "consumerId" = ${consumerId}
+        AND network = ${network}
+        ${dateSql}
+      GROUP BY 1
+    `;
+
+    const data = rows
+      .map((v) => ({
+        asset: v.asset,
+        amount: formatAmount(v.settled),
+        pending: formatAmount(v.pending),
+        count: asInt(v.settled_count),
       }))
-      .sort((a, b) => num(b.amount) - num(a.amount));
+      .sort((a, b) => {
+        const diff = toStroops(b.amount) - toStroops(a.amount);
+        return diff > 0n ? 1 : diff < 0n ? -1 : 0;
+      });
 
     return { data, total: data.length };
   }
 
   // ── API request logs (real inbound requests, with details) ──────────────────
-  async apiLogs(consumer: GatewayConsumer, take = 100) {
+  async apiLogs(
+    consumer: GatewayConsumer,
+    query: QueryAnalyticsLogsDto = { take: 100 },
+  ) {
+    const take = query.take ?? 100;
     // RequestLog is keyed by the forwarded consumer username (not the local id).
     const rows = await this.prisma.requestLog.findMany({
       where: { consumer: consumer.username },
@@ -246,7 +396,11 @@ export class AnalyticsService {
   }
 
   // ── Webhook delivery logs (across all the consumer's endpoints) ──────────────
-  async webhookLogs(consumer: GatewayConsumer, take = 100) {
+  async webhookLogs(
+    consumer: GatewayConsumer,
+    query: QueryAnalyticsLogsDto = { take: 100 },
+  ) {
+    const take = query.take ?? 100;
     const consumerId = await this.resolveConsumerId(consumer);
     const endpoints = await this.prisma.webhookEndpoint.findMany({
       where: { consumerId },
