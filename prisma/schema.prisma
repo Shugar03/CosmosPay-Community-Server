@@ -81,6 +81,7 @@ model RequestLog {
 
   @@index([consumer])
   @@index([createdAt])
+  @@index([consumer, createdAt])
   @@map("request_log")
 }
 
@@ -258,6 +259,7 @@ model PaymentIntent {
   @@unique([consumerId, memo]) // idempotency: one intent per (consumer, memo)
   @@index([consumerId])
   @@index([status])
+  @@index([consumerId, network, createdAt])
   @@map("payment_intent")
 }
 

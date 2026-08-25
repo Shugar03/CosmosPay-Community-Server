@@ -2,6 +2,7 @@ import { Injectable, NotFoundException } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { ReceiversService } from '../kyc/receivers/receivers.service';
 import { RequestTosDto } from '../kyc/receivers/dto/request-tos.dto';
+import { fromStroops, toStroops } from '../swaps/swap-math';
 
 /** Clamp a requested page size to a sane range. */
 function take(n?: number): number {
@@ -10,14 +11,6 @@ function take(n?: number): number {
 }
 function skip(n?: number): number {
   return !n || n < 0 ? 0 : n;
-}
-function num(amount: string | null): number {
-  if (!amount) return 0;
-  const v = Number(amount);
-  return Number.isFinite(v) ? v : 0;
-}
-function money(n: number): string {
-  return Number(n.toFixed(7)).toString();
 }
 const consumerSelect = {
   consumer: { select: { apisixUsername: true, credentialId: true } },
@@ -106,18 +99,24 @@ export class AdminService {
       }),
     ]);
 
-    // Settled volume per asset (succeeded payment intents).
-    const volMap = new Map<string, { amount: number; count: number }>();
+    // Settled volume per asset (succeeded payment intents) — stroops / bigint.
+    const volMap = new Map<string, { amount: bigint; count: number }>();
     for (const i of succeededIntents) {
       const key = !i.asset || i.asset === 'native' ? 'XLM' : i.asset;
-      const cur = volMap.get(key) ?? { amount: 0, count: 0 };
-      cur.amount += num(i.amount);
+      const cur = volMap.get(key) ?? { amount: 0n, count: 0 };
+      if (i.amount) {
+        try {
+          cur.amount += toStroops(i.amount);
+        } catch {
+          // skip malformed amounts
+        }
+      }
       cur.count += 1;
       volMap.set(key, cur);
     }
     const volume = [...volMap.entries()].map(([asset, v]) => ({
       asset,
-      amount: money(v.amount),
+      amount: fromStroops(v.amount),
       count: v.count,
     }));
 

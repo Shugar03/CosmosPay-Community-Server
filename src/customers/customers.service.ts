@@ -1,6 +1,7 @@
 import { Injectable, NotFoundException } from '@nestjs/common';
 import { GatewayConsumer } from '../common/interfaces/gateway-consumer.interface';
 import { PrismaService } from '../prisma/prisma.service';
+import { fromStroops, toStroops } from '../swaps/swap-math';
 import { CreateCustomerDto } from './dto/create-customer.dto';
 import { UpdateCustomerDto } from './dto/update-customer.dto';
 
@@ -52,15 +53,21 @@ export class CustomersService {
 
     const stats = new Map<
       string,
-      { payments: number; succeeded: number; total: number }
+      { payments: number; succeeded: number; total: bigint }
     >();
     for (const i of intents) {
       const acct = i.source as string;
-      const cur = stats.get(acct) ?? { payments: 0, succeeded: 0, total: 0 };
+      const cur = stats.get(acct) ?? { payments: 0, succeeded: 0, total: 0n };
       cur.payments += 1;
       if (i.status === 'SUCCEEDED') {
         cur.succeeded += 1;
-        cur.total += Number(i.amount) || 0;
+        if (i.amount) {
+          try {
+            cur.total += toStroops(i.amount);
+          } catch {
+            // skip malformed amounts
+          }
+        }
       }
       stats.set(acct, cur);
     }
@@ -69,13 +76,13 @@ export class CustomersService {
       const s = (c.account && stats.get(c.account)) || {
         payments: 0,
         succeeded: 0,
-        total: 0,
+        total: 0n,
       };
       return {
         ...c,
         payments: s.payments,
         succeeded: s.succeeded,
-        total: Number(s.total.toFixed(7)).toString(),
+        total: fromStroops(s.total),
       };
     });
 
